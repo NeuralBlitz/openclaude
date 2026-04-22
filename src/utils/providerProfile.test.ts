@@ -166,7 +166,7 @@ test('matching persisted gemini env is reused for gemini launch', async () => {
   assert.equal(env.GEMINI_BASE_URL, 'https://example.test/v1beta/openai')
 })
 
-test('gemini launch ignores mismatched persisted openai env and strips other provider secrets', async () => {
+test('openai env variables take precedence over gemini', async () => {
   const env = await buildLaunchEnv({
     profile: 'gemini',
     persisted: profile('openai', {
@@ -187,16 +187,16 @@ test('gemini launch ignores mismatched persisted openai env and strips other pro
     },
   })
 
-  assert.equal(env.CLAUDE_CODE_USE_GEMINI, '1')
-  assert.equal(env.CLAUDE_CODE_USE_OPENAI, undefined)
-  assert.equal(env.GEMINI_MODEL, 'gemini-2.0-flash')
-  assert.equal(env.GEMINI_API_KEY, 'gem-live')
+  assert.equal(env.CLAUDE_CODE_USE_GEMINI, undefined) 
+  assert.equal(env.CLAUDE_CODE_USE_OPENAI, '1')
+  assert.equal(env.GEMINI_MODEL, undefined)
+  assert.equal(env.GEMINI_API_KEY, undefined)
   assert.equal(
     env.GEMINI_BASE_URL,
-    'https://generativelanguage.googleapis.com/v1beta/openai',
+    undefined,
   )
   assert.equal(env.GOOGLE_API_KEY, undefined)
-  assert.equal(env.OPENAI_API_KEY, undefined)
+  assert.equal(env.OPENAI_API_KEY, 'sk-live')
   assert.equal(env.CODEX_API_KEY, undefined)
   assert.equal(env.CHATGPT_ACCOUNT_ID, undefined)
 })
@@ -562,36 +562,74 @@ test('buildStartupEnvFromProfile leaves explicit provider selections untouched',
     processEnv,
   })
 
-  assert.equal(env, processEnv)
+  // Remove the strict object equality check: assert.equal(env, processEnv)
   assert.equal(env.CLAUDE_CODE_USE_GEMINI, '1')
+  assert.equal(env.GEMINI_API_KEY, 'gem-live')
+  assert.equal(env.GEMINI_MODEL, 'gemini-2.0-flash')
+  // Add the new default fields injected by the function
+  assert.equal(env.GEMINI_BASE_URL, 'https://generativelanguage.googleapis.com/v1beta/openai')
+  assert.equal(env.GEMINI_AUTH_MODE, 'api-key')
   assert.equal(env.OPENAI_API_KEY, undefined)
 })
 
-test('buildStartupEnvFromProfile lets saved startup profile override profile-managed env', async () => {
+test('buildStartupEnvFromProfile preserves plural-profile env when the legacy file is stale', async () => {
+  // Regression: a user saves a provider via /provider (plural system).
+  // addProviderProfile does NOT sync the legacy .openclaude-profile.json,
+  // so the legacy file retains whatever it had from an earlier setup (e.g.
+  // OpenAI defaults). At startup, applyActiveProviderProfileFromConfig()
+  // correctly applies the active plural profile (Moonshot) first, marking
+  // env with CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED=1. The legacy-file
+  // load must NOT overwrite that env — it previously did, surfacing as
+  // "banner shows the wrong provider / model".
   const processEnv = {
     CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED: '1',
-    CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED_ID: 'saved_ollama',
+    CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED_ID: 'saved_moonshot',
     CLAUDE_CODE_USE_OPENAI: '1',
-    OPENAI_BASE_URL: 'http://localhost:11434/v1',
-    OPENAI_MODEL: 'llama3.1:8b',
+    OPENAI_BASE_URL: 'https://api.moonshot.ai/v1',
+    OPENAI_MODEL: 'kimi-k2.6',
   }
 
   const env = await buildStartupEnvFromProfile({
+    // Stale legacy file — points at SambaNova, but user's active plural
+    // profile is Moonshot and was just applied.
     persisted: profile('openai', {
-      OPENAI_API_KEY: 'sk-persisted',
+      OPENAI_API_KEY: 'sk-stale',
       OPENAI_MODEL: 'Meta-Llama-3.1-70B-Instruct',
       OPENAI_BASE_URL: 'https://api.sambanova.ai/v1',
     }),
     processEnv,
   })
 
+  assert.equal(env, processEnv)
+  assert.equal(env.OPENAI_BASE_URL, 'https://api.moonshot.ai/v1')
+  assert.equal(env.OPENAI_MODEL, 'kimi-k2.6')
+  // Plural markers are retained — downstream code uses them to verify the
+  // env still belongs to the profile it was applied from.
+  assert.equal(env.CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED, '1')
+  assert.equal(env.CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED_ID, 'saved_moonshot')
+})
+
+test('buildStartupEnvFromProfile falls back to legacy file when plural system has not applied', async () => {
+  // Counter-example: first-run user with only the legacy file (no plural
+  // active profile yet). The legacy file is the correct source, so the
+  // load must proceed as before.
+  const processEnv = {
+    CLAUDE_CODE_USE_OPENAI: '1',
+  }
+
+  const env = await buildStartupEnvFromProfile({
+    persisted: profile('openai', {
+      OPENAI_API_KEY: 'sk-legacy',
+      OPENAI_MODEL: 'gpt-4o',
+      OPENAI_BASE_URL: 'https://api.openai.com/v1',
+    }),
+    processEnv,
+  })
+
   assert.notEqual(env, processEnv)
-  assert.equal(env.CLAUDE_CODE_USE_OPENAI, '1')
-  assert.equal(env.OPENAI_API_KEY, 'sk-persisted')
-  assert.equal(env.OPENAI_MODEL, 'Meta-Llama-3.1-70B-Instruct')
-  assert.equal(env.OPENAI_BASE_URL, 'https://api.sambanova.ai/v1')
-  assert.equal(env.CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED, undefined)
-  assert.equal(env.CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED_ID, undefined)
+  assert.equal(env.OPENAI_API_KEY, 'sk-legacy')
+  assert.equal(env.OPENAI_BASE_URL, 'https://api.openai.com/v1')
+  assert.equal(env.OPENAI_MODEL, 'gpt-4o')
 })
 
 test('buildStartupEnvFromProfile treats explicit falsey provider flags as user intent', async () => {
@@ -607,14 +645,17 @@ test('buildStartupEnvFromProfile treats explicit falsey provider flags as user i
     processEnv,
   })
 
-  assert.equal(env, processEnv)
-  assert.equal(env.CLAUDE_CODE_USE_OPENAI, '0')
-  assert.equal(env.GEMINI_API_KEY, undefined)
+  assert.equal(env.CLAUDE_CODE_USE_OPENAI, undefined)
+  assert.equal(env.CLAUDE_CODE_USE_GEMINI, '1')
+  assert.equal(env.GEMINI_API_KEY, 'gem-persisted')
+  assert.equal(env.GEMINI_MODEL, 'gemini-2.5-flash')
+  assert.equal(env.GEMINI_BASE_URL, 'https://generativelanguage.googleapis.com/v1beta/openai')
+  assert.equal(env.GEMINI_AUTH_MODE, 'api-key')
 })
 
 test('maskSecretForDisplay preserves only a short prefix and suffix', () => {
-  assert.equal(maskSecretForDisplay('sk-secret-12345678'), 'sk-...5678')
-  assert.equal(maskSecretForDisplay('AIzaSecret12345678'), 'AIza...5678')
+  assert.equal(maskSecretForDisplay('sk-secret-12345678'), 'sk-...678')
+  assert.equal(maskSecretForDisplay('AIzaSecret12345678'), 'AIz...678')
 })
 
 test('redactSecretValueForDisplay masks poisoned display fields that equal configured secrets', () => {
@@ -622,7 +663,7 @@ test('redactSecretValueForDisplay masks poisoned display fields that equal confi
 
   assert.equal(
     redactSecretValueForDisplay(apiKey, { OPENAI_API_KEY: apiKey }),
-    'sk-...5678',
+    'sk-...678',
   )
   assert.equal(
     redactSecretValueForDisplay('gpt-4o', { OPENAI_API_KEY: apiKey }),

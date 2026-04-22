@@ -33,6 +33,12 @@ export type ModelShortName = string
 export type ModelName = string
 export type ModelSetting = ModelName | ModelAlias | null
 
+function normalizeModelSetting(value: unknown): ModelName | ModelAlias | undefined {
+  if (typeof value !== 'string') return undefined
+  const trimmed = value.trim()
+  return trimmed.length > 0 ? trimmed : undefined
+}
+
 export function getSmallFastModel(): ModelName {
   if (process.env.ANTHROPIC_SMALL_FAST_MODEL) return process.env.ANTHROPIC_SMALL_FAST_MODEL
   // For Gemini provider, use a fast model
@@ -46,9 +52,24 @@ export function getSmallFastModel(): ModelName {
   if (getAPIProvider() === 'openai') {
     return process.env.OPENAI_MODEL || 'gpt-4o-mini'
   }
+  // Codex provider — OPENAI_MODEL is always set for Codex profiles; only fall
+  // back to a codex-spark alias when an override env strips it.
+  if (getAPIProvider() === 'codex') {
+    return process.env.OPENAI_MODEL || 'codexspark'
+  }
   // For GitHub Copilot provider
   if (getAPIProvider() === 'github') {
     return process.env.OPENAI_MODEL || 'github:copilot'
+  }
+  // NVIDIA NIM — OPENAI_MODEL carries the user's active NIM model; use a
+  // small Meta Llama variant as the conservative fallback.
+  if (getAPIProvider() === 'nvidia-nim') {
+    return process.env.OPENAI_MODEL || 'meta/llama-3.1-8b-instruct'
+  }
+  // MiniMax — OPENAI_MODEL carries the active MiniMax model; fall back to
+  // the fastest tier (M2.5-highspeed) when missing.
+  if (getAPIProvider() === 'minimax') {
+    return process.env.OPENAI_MODEL || 'MiniMax-M2.5-highspeed'
   }
   return getDefaultHaikuModel()
 }
@@ -82,15 +103,29 @@ export function getUserSpecifiedModelSetting(): ModelSetting | undefined {
     specifiedModel = modelOverride
   } else {
     const settings = getSettings_DEPRECATED() || {}
+    const setting = normalizeModelSetting(settings.model)
     // Read the model env var that matches the active provider to prevent
     // cross-provider leaks (e.g. ANTHROPIC_MODEL sent to the OpenAI API).
+    //
+    // All OpenAI-shim providers (openai, codex, github, nvidia-nim, minimax)
+    // set CLAUDE_CODE_USE_OPENAI=1 + OPENAI_MODEL via
+    // applyProviderProfileToProcessEnv. Earlier this check only included
+    // openai/github — codex/nvidia-nim/minimax fell through to the stale
+    // settings.model, so switching from (say) Moonshot to Codex kept firing
+    // `kimi-k2.6` at the Codex endpoint and getting 400s.
     const provider = getAPIProvider()
+    const isOpenAIShimProvider =
+      provider === 'openai' ||
+      provider === 'codex' ||
+      provider === 'github' ||
+      provider === 'nvidia-nim' ||
+      provider === 'minimax'
     specifiedModel =
       (provider === 'gemini' ? process.env.GEMINI_MODEL : undefined) ||
       (provider === 'mistral' ? process.env.MISTRAL_MODEL : undefined) ||
-      (provider === 'openai' || provider === 'gemini' || provider === 'mistral' || provider === 'github' ? process.env.OPENAI_MODEL : undefined) ||
+      (isOpenAIShimProvider ? process.env.OPENAI_MODEL : undefined) ||
       (provider === 'firstParty' ? process.env.ANTHROPIC_MODEL : undefined) ||
-      settings.model ||
+      setting ||
       undefined
   }
 
@@ -133,7 +168,7 @@ export function getDefaultOpusModel(): ModelName {
   }
   // Gemini provider
   if (getAPIProvider() === 'gemini') {
-    return process.env.GEMINI_MODEL || 'gemini-2.5-pro-preview-03-25'
+    return process.env.GEMINI_MODEL || 'gemini-2.5-pro'
   }
   // Mistral provider
   if (getAPIProvider() === 'mistral') {
@@ -150,6 +185,14 @@ export function getDefaultOpusModel(): ModelName {
   // GitHub Copilot provider
   if (getAPIProvider() === 'github') {
     return process.env.OPENAI_MODEL || 'github:copilot'
+  }
+  // NVIDIA NIM
+  if (getAPIProvider() === 'nvidia-nim') {
+    return process.env.OPENAI_MODEL || 'nvidia/llama-3.1-nemotron-70b-instruct'
+  }
+  // MiniMax — flagship tier for "opus"-equivalent.
+  if (getAPIProvider() === 'minimax') {
+    return process.env.OPENAI_MODEL || 'MiniMax-M2.7'
   }
   // 3P providers (Bedrock, Vertex, Foundry) — kept as a separate branch
   // even when values match, since 3P availability lags firstParty and
@@ -185,6 +228,14 @@ export function getDefaultSonnetModel(): ModelName {
   if (getAPIProvider() === 'github') {
     return process.env.OPENAI_MODEL || 'github:copilot'
   }
+  // NVIDIA NIM
+  if (getAPIProvider() === 'nvidia-nim') {
+    return process.env.OPENAI_MODEL || 'nvidia/llama-3.1-nemotron-70b-instruct'
+  }
+  // MiniMax — mid tier for "sonnet"-equivalent.
+  if (getAPIProvider() === 'minimax') {
+    return process.env.OPENAI_MODEL || 'MiniMax-M2.5'
+  }
   // Default to Sonnet 4.5 for 3P since they may not have 4.6 yet
   if (getAPIProvider() !== 'firstParty') {
     return getModelStrings().sonnet45
@@ -216,6 +267,14 @@ export function getDefaultHaikuModel(): ModelName {
   // Gemini provider
   if (getAPIProvider() === 'gemini') {
     return process.env.GEMINI_MODEL || 'gemini-2.0-flash-lite'
+  }
+  // NVIDIA NIM
+  if (getAPIProvider() === 'nvidia-nim') {
+    return process.env.OPENAI_MODEL || 'meta/llama-3.1-8b-instruct'
+  }
+  // MiniMax — fastest tier for "haiku"-equivalent.
+  if (getAPIProvider() === 'minimax') {
+    return process.env.OPENAI_MODEL || 'MiniMax-M2.5-highspeed'
   }
 
   // Haiku 4.5 is available on all platforms (first-party, Foundry, Bedrock, Vertex)
@@ -264,7 +323,11 @@ export function getDefaultMainLoopModelSetting(): ModelName | ModelAlias {
   // GitHub Copilot provider: check settings.model first, then env, then default
   if (getAPIProvider() === 'github') {
     const settings = getSettings_DEPRECATED() || {}
-    return settings.model || process.env.OPENAI_MODEL || 'github:copilot'
+    return (
+      normalizeModelSetting(settings.model) ||
+      normalizeModelSetting(process.env.OPENAI_MODEL) ||
+      'github:copilot'
+    )
   }
   // Gemini provider: always use the configured Gemini model
   if (getAPIProvider() === 'gemini') {
@@ -595,7 +658,10 @@ export function getPublicModelName(model: ModelName): string {
 export function parseUserSpecifiedModel(
   modelInput: ModelName | ModelAlias,
 ): ModelName {
-  const modelInputTrimmed = modelInput.trim()
+  const modelInputTrimmed = normalizeModelSetting(modelInput)
+  if (!modelInputTrimmed) {
+    return getDefaultSonnetModel()
+  }
   const normalizedModel = modelInputTrimmed.toLowerCase()
 
   const has1mTag = has1mContext(normalizedModel)
